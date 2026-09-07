@@ -1,0 +1,90 @@
+{
+    "version": "0.2.0",
+
+    "compounds": [
+        {
+            "name": "Debug Full NextGen Standup Agent (API + Bot)",
+            "configurations": [
+                "Debug API Server (server.js)",
+                "Debug Bot (index.js)"
+            ],
+            "stopAll": true
+        }
+    ],
+
+    "configurations": [
+
+        // ================================================
+        // Express REST API (http://localhost:5000/api/*)
+        // ================================================
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Debug API Server (server.js)",
+
+            "program": "${workspaceFolder}/server.js",
+            "cwd": "${workspaceFolder}",
+
+            // server.js does not call dotenv.config() itself, so we load
+            // .env explicitly to make GROQ_API_KEY / GROQ_MODEL available.
+            "envFile": "${workspaceFolder}/.env",
+
+            "console": "integratedTerminal",
+            "internalConsoleOptions": "openOnSessionStart",
+
+            "restart": true,
+            "autoAttachChildProcesses": true,
+
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ]
+        },
+
+        // ================================================
+        // Bot Framework bot (http://localhost:3978/api/messages)
+        // ================================================
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Debug Bot (index.js)",
+
+            "program": "${workspaceFolder}/index.js",
+            "cwd": "${workspaceFolder}",
+
+            // index.js already loads .env via dotenv.config();
+            // envFile is redundant but harmless and keeps parity
+            // with the API server config.
+            "envFile": "${workspaceFolder}/.env",
+
+            "console": "integratedTerminal",
+            "internalConsoleOptions": "openOnSessionStart",
+
+            "restart": true,
+            "autoAttachChildProcesses": true,
+
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ]
+        },
+
+        // ================================================
+        // Attach to a process started outside VS Code
+        // e.g.  node --inspect=9229 server.js
+        // ================================================
+        {
+            "type": "node",
+            "request": "attach",
+            "name": "Attach to Running Node Process",
+
+            "port": 9229,
+            "restart": true,
+
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ]
+        }
+    ]
+}

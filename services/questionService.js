@@ -42,6 +42,10 @@ async function saveQuestions(params) {
 // the saved response (if any), per-question status,
 // sentiment/blocker/risk flags and the risk reason.
 // =============================================
+// Most recent confirmed Azure DevOps status for this ticket in this
+// session. The web-chat card persists each push in ado_updates, so old
+// sessions can still report "Done" even when the work_items snapshot or
+// the live board lookup is unavailable.
 async function getSessionQuestions(sessionId) {
     const result = await pool.query(
         `SELECT
@@ -61,7 +65,18 @@ async function getSessionQuestions(sessionId) {
             wi.external_ticket_id AS ticket_id,
             wi.title AS work_item_title,
             wi.state AS work_item_state,
-            wi.inactive_days,
+            COALESCE(wi.days_in_state, wi.inactive_days, 0) AS days_in_state,
+            COALESCE(wi.inactive_days, 0) AS inactive_days,
+
+            (
+                SELECT applied_status
+                FROM ado_updates
+                WHERE standup_session_id = sq.standup_session_id
+                  AND external_ticket_id = wi.external_ticket_id
+                  AND applied_status IS NOT NULL
+                ORDER BY applied_at DESC NULLS LAST, id DESC
+                LIMIT 1
+            ) AS ado_applied_status,
 
             sr.id AS response_id,
             sr.response,

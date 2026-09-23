@@ -63,6 +63,17 @@ ALTER TABLE ai_insights
     ADD COLUMN IF NOT EXISTS risk_level VARCHAR(20) DEFAULT 'LOW';
 
 -- =============================================
+-- work_items: inactivity + state-duration snapshot
+-- (older live DBs only have inactive_days; the card
+-- badge needs days_in_state + timestamps too)
+-- =============================================
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS inactive_days INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS days_in_state INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS state_changed TIMESTAMPTZ;
+
+-- =============================================
 -- Indexes for the timeout queries
 -- =============================================
 CREATE INDEX IF NOT EXISTS idx_sessions_lifecycle_status

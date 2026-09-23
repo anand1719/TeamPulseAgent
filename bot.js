@@ -12,6 +12,7 @@ const {
     getActiveWaitingSessions
 } = require("./services/standupService");
 
+
 const {
     getOpenQuestionForMember
 } = require("./services/questionService");
@@ -31,7 +32,9 @@ class MyBot extends ActivityHandler {
                 TurnContext.getConversationReference(context.activity);
             console.log("Conversation saved:", savedConversationReference.conversation.id);
 
-            const userMessage = (context.activity.text || "").toLowerCase().trim();
+            const rawText = (context.activity.text || "").trim();
+            const userMessage = rawText.toLowerCase();
+
             const value = context.activity.value || null;
 
             // =========================================
@@ -40,12 +43,18 @@ class MyBot extends ActivityHandler {
             if (value && value.questionId) {
                 const typedText = String(value.update || value.response || "").trim();
                 const statusLabel = value.status || null;
+                // The card's "Submit Update" action is the only way to
+                // answer it (it carries fromInput). A payload without the
+                // flag - e.g. one of the old status buttons - must never be
+                // recorded, so the explicit-submit marker is passed on.
+                const explicitSubmit = value.fromInput === true;
 
                 const answered = await handleUserResponse(
                     context,
                     value.questionId,
                     typedText,
-                    statusLabel
+                    statusLabel,
+                    { explicitSubmit }
                 );
 
                 if (!answered) {
@@ -80,11 +89,15 @@ class MyBot extends ActivityHandler {
                     );
 
                     if (open) {
+                        // A typed chat reply IS an explicit update, and
+                        // the ORIGINAL text (not the lower-cased copy used
+                        // for command matching) is what gets stored.
                         const answered = await handleUserResponse(
                             context,
                             open.id,
-                            userMessage,
-                            null
+                            rawText,
+                            null,
+                            { explicitSubmit: true }
                         );
                         if (answered) {
                             return next();

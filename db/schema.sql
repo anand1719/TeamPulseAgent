@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS work_items (
     title                TEXT,
     state                VARCHAR(100),
     priority             VARCHAR(50),
+    inactive_days        INT          DEFAULT 0,
+    days_in_state        INT          DEFAULT 0,
+    last_updated         TIMESTAMPTZ,
+    state_changed        TIMESTAMPTZ,
     created_at           TIMESTAMPTZ  DEFAULT NOW()
 );
 

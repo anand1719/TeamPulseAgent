@@ -25,15 +25,14 @@
             "program": "${workspaceFolder}/server.js",
             "cwd": "${workspaceFolder}",
 
-            // server.js does not call dotenv.config() itself, so we load
-            // .env explicitly to make GROQ_API_KEY / GROQ_MODEL available.
+            // server.js calls require("dotenv").config() itself;
+            // envFile kept for parity/explicitness.
             "envFile": "${workspaceFolder}/.env",
 
-            "console": "integratedTerminal",
+            "console": "internalConsole",
             "internalConsoleOptions": "openOnSessionStart",
 
-            "restart": true,
-            "autoAttachChildProcesses": true,
+            "restart": false,
 
             "skipFiles": [
                 "<node_internals>/**",
@@ -57,11 +56,10 @@
             // with the API server config.
             "envFile": "${workspaceFolder}/.env",
 
-            "console": "integratedTerminal",
+            "console": "internalConsole",
             "internalConsoleOptions": "openOnSessionStart",
 
-            "restart": true,
-            "autoAttachChildProcesses": true,
+            "restart": false,
 
             "skipFiles": [
                 "<node_internals>/**",

@@ -56,6 +56,14 @@ const {
 const DEFAULT_TIMEOUT_MINUTES =
     Number(process.env.STANDUP_TIMEOUT_MINUTES) || 30;
 
+// A card answer must contain a typed update (default). Set
+// STANDUP_REQUIRE_COMMENT=false to also accept a status-only answer that was
+// explicitly submitted with "Submit Update". (A status selection on its own
+// is never an answer.)
+const REQUIRE_COMMENT =
+    String(process.env.STANDUP_REQUIRE_COMMENT || "true").toLowerCase() !== "false";
+
+
 // Guards against multiple overlapping standup runs
 // (scheduler., auto-start,, and manual "run standup" triggers).
 let standupRunning = false;
@@ -143,15 +151,28 @@ async function executeStandupWorkflow(context) {
 
             const timeoutMinutes = team.response_timeout_minutes || DEFAULT_TIMEOUT_MINUTES;
 
-            // STEP 3a - CREATE SESSION (state STARTED)
+            // STEP 3a - SESSION (per-day guard)
+            // The standup runs once per day and is started
+            // ONLY by the scheduler - if today's session
+            // already exists, resume it instead of creating
+            // a duplicate.
             let session;
             try {
-                session = await saveSession({
-                    team_id: teamId,
-                    standup_date: new Date(),
-                    status: "IN_PROGRESS",
-                    lifecycle_status: "STARTED"
-                });
+                const { getTodaySession } =
+                    require("../services/sessionStarter");
+                session = await getTodaySession(teamId);
+                if (session) {
+                    console.log(
+                        `Standup already ran today for ${ team.team_name } (session ${ session.id }) - resuming.`
+                    );
+                } else {
+                    session = await saveSession({
+                        team_id: teamId,
+                        standup_date: new Date(),
+                        status: "IN_PROGRESS",
+                        lifecycle_status: "STARTED"
+                    });
+                }
             } catch (error) {
                 console.error(`Standup Session API Error for Team ${ team.team_name }:`, error.response?.data || error.message);
                 await context.sendActivity(`Failed to create standup session for ${ team.team_name }`);
@@ -159,11 +180,13 @@ async function executeStandupWorkflow(context) {
             }
 
             const sessionId = session.id;
-            console.log(`Standup Session Created: ${ sessionId }`);
-            await updateSessionLifecycle(sessionId, "QUESTIONS_SENT", {
-                questions_sent_at: new Date(),
-                response_deadline: new Date(Date.now() + timeoutMinutes * 60 * 1000)
-            });
+            console.log(`Standup Session: ${ sessionId }`);
+            if (session.lifecycle_status === "STARTED") {
+                await updateSessionLifecycle(sessionId, "QUESTIONS_SENT", {
+                    questions_sent_at: new Date(),
+                    response_deadline: new Date(Date.now() + timeoutMinutes * 60 * 1000)
+                });
+            }
 
             // STEP 4 - ITERATE MEMBERS -> WORK ITEMS -> GENERATE/SAVE/SEND CARDS
             for (const member of team.members) {
@@ -221,7 +244,11 @@ async function executeStandupWorkflow(context) {
                                     team_member_id: memberId,
                                     source_system: "azure-devops",
                                     title: item.title,
-                                    state: item.state
+                                    state: item.state,
+                                    inactive_days: item.days_inactive || 0,
+                                    days_in_state: item.days_in_state || 0,
+                                    last_updated: item.last_updated || null,
+                                    state_changed: item.state_changed || null
                                 });
                             workItemDbId = snapshotResponse.data.id;
                         }
@@ -244,6 +271,9 @@ async function executeStandupWorkflow(context) {
                             title: item.title,
                             state: item.state,
                             inactiveDays: item.days_inactive || 0,
+                            // Days spent in the current state - the honest
+                            // number for the "not started"/"blocked" hints.
+                            daysInState: item.days_in_state || 0,
                             question,
                             timeoutMinutes
                         });
@@ -306,12 +336,19 @@ function armDeadlineTimer(sessionId, timeoutMinutes) {
 
 // =============================================
 // HANDLE A USER RESPONSE (card submit or typed)
-// Flow: Save Response -> AI Processing -> Context
-// Enrichment -> Risk/Decision Engine -> (per-response
-// escalation) -> mark ANSWERED -> if session complete
-// (received) then finalize (early-exit, no waiting).
+// Flow: Validate Submit -> Save Response -> AI
+// Processing -> mark ANSWERED -> if session
+// complete (received) then finalize (early-exit,
+// no waiting).
+//
+// An answer is recorded ONLY when the member really
+// submitted the card ("Submit Update", flagged with
+// fromInput in bot.js) and provided an update. A
+// status selection on its own never answers the
+// question, so a status click can no longer save a
+// response / mark the item ANSWERED by accident.
 // =============================================
-async function handleUserResponse(context, questionId, userText, statusLabel) {
+async function handleUserResponse(context, questionId, userText, statusLabel, options = {}) {
     if (!questionId) {
         return false;
     }
@@ -333,23 +370,54 @@ async function handleUserResponse(context, questionId, userText, statusLabel) {
         return true;
     }
 
-    // Determine the response text: button click (status
-    // label as the answer) or typed input.
-    const responseText = (userText && String(userText).trim())
-        ? String(userText).trim()
-        : (statusLabel ? `Status: ${ statusLabel }` : "");
+    const commentText = String(userText || "").trim();
+    const status = String(statusLabel || "").trim();
 
-    if (!responseText) {
-        await context.sendActivity("Please type your update in the card, or click a status button.");
+    // (1) The card's status control is a plain SELECTION, so a payload that
+    //     never went through "Submit Update" - a status click on its own, or
+    //     an answer from an older card whose status buttons submitted
+    //     immediately - is NOT an answer.
+    if (options.explicitSubmit === false) {
+        await context.sendActivity(
+            "Please type your update in the card and click \"Submit Update\" - " +
+            "selecting a status on its own does not record your standup update."
+        );
         return true;
     }
+
+    // (2) Nothing at all was provided.
+    if (!commentText && !status) {
+        await context.sendActivity(
+            "Please type your update in the card and click \"Submit Update\"."
+        );
+        return true;
+    }
+
+    // (3) A status without a typed update carries no information, so it is
+    //     refused unless STANDUP_REQUIRE_COMMENT=false.
+    if (REQUIRE_COMMENT && !commentText) {
+        await context.sendActivity(
+            `Please add a short update for the "${ status }" status, then click "Submit Update".`
+        );
+        return true;
+    }
+
+    // The selected status travels with the typed update so the reports and
+    // the AI keep both:
+    //   status only     -> "Status: Blocked"
+    //   status + update -> "Status: Blocked | waiting on the API keys"
+    const responseText = status
+        ? (commentText
+            ? `Status: ${ status } | ${ commentText }`
+            : `Status: ${ status }`)
+        : commentText;
 
     const contextText = [
         q.work_item_title,
         q.work_item_state
     ].filter(Boolean).join(" - ");
 
-    // STEP 1 - AI PROCESSING (sentiment, blocker, risk)?
+    // STEP 1 - AI PROCESSING (sentiment, blocker, risk)
     const analysis = await analyzeResponse(responseText, contextText);
 
     // STEP 2 - SAVE RESPONSE (with risk flags)
@@ -358,7 +426,9 @@ async function handleUserResponse(context, questionId, userText, statusLabel) {
         response: responseText,
         sentiment: analysis.sentiment,
         blocker_detected: analysis.blocker_detected,
-        response_type: statusLabel ? "BUTTON" : "TEXT",
+        response_type: status
+            ? (commentText ? "STATUS_TEXT" : "STATUS")
+            : "TEXT",
         risk_detected: analysis.risk_detected,
         risk_reason: analysis.risk_reason
     });
@@ -367,7 +437,7 @@ async function handleUserResponse(context, questionId, userText, statusLabel) {
     await markQuestionAnswered(q.id);
 
     await context.sendActivity(
-        `Thanks ${ q.member_name }, your update was saved (${ q.ticket_id || "work item" } - ${ q.work_item_title || "" }).`
+        `Thanks ${ q.member_name }, your update was saved (${ q.ticket_id || "work item" } - ${ q.work_item_title || "" })${ status ? ` [${ status }]` : "" }.`
     );
 
     // STEP 4 - EARLY FINALIZE WHEN ALL ANSWERED
@@ -509,7 +579,10 @@ async function finalizeStandup(sessionId, context) {
             blockers: (report.rows[0].blockers || "").split(" | ").filter(Boolean),
             risks: (report.rows[0].risks || "").split(" | ").filter(Boolean),
             recommendations: (report.rows[0].recommendations || "").split(" | ").filter(Boolean),
-            sentiment: report.rows[0].sentiment
+            sentiment: report.rows[0].sentiment,
+            // The card's download action points at the report
+            // endpoint, which renders the PDF on demand.
+            reportUrl: `${ API_BASE }/api/reports/${ sessionId }/pdf`
         }));
     }
 

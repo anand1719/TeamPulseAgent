@@ -17,11 +17,18 @@ router.post("/", async (req, res) => {
     }
 });
 
-// GENERATE AI INSIGHTS FROM LATEST STANDUP SESSION
+// POST insights/generate requires a session id now.
 router.post("/generate", async (req, res) => {
     try {
+        const sessionId = req.body.sessionId || req.body.session_id || req.query.sessionId;
+        if (!sessionId) {
+            return res.status(400).json({
+                success: false,
+                message: "sessionId is required"
+            });
+        }
         const insight =
-            await generateStandupInsights();
+            await generateStandupInsights(sessionId);
         res.json({
             success: true,
             data: insight

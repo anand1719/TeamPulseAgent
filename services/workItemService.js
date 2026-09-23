@@ -101,39 +101,47 @@ async function getWorkItemByMember(memberName) {
 
             const fields = item.fields;
 
-            // INACTIVITY CALCULATION
+            // INACTIVITY + STATE-DURATION CALCULATION
             // System.ChangedDate moves on ANY field change
             // (comments, tags, iterations, ...), so it is the
-            // best available "last touched" signal. Guard
-            // against missing/invalid dates and clock skew so
-            // days_inactive is always a sane non-negative int.
+            // best available "last touched" signal. The honest
+            // number for "not started" / "blocked" hints is
+            // Microsoft.VSTS.Common.StateChangeDate - how long
+            // the item has sat in its CURRENT state. Both are
+            // guarded against missing/invalid dates and clock
+            // skew so the counts are always sane ints >= 0.
 
             const changedDateValue =
                 fields["System.ChangedDate"];
 
-            const changedDate =
-                changedDateValue
-                    ? new Date(changedDateValue)
-                    : null;
+            const stateChangedValue =
+                fields["Microsoft.VSTS.Common.StateChangeDate"];
 
             const currentDate =
                 new Date();
 
-            let daysInactive = 0;
-
-            if (changedDate && !isNaN(changedDate.getTime())) {
-
-                const diffTime =
-                    currentDate - changedDate;
-
-                daysInactive =
-                    Math.max(
-                        0,
-                        Math.floor(
-                            diffTime / (1000 * 60 * 60 * 24)
-                        )
-                    );
+            function daysSince(value) {
+                if (!value) {
+                    return 0;
+                }
+                const parsed = new Date(value);
+                if (isNaN(parsed.getTime())) {
+                    return 0;
+                }
+                const diffTime = currentDate - parsed;
+                return Math.max(
+                    0,
+                    Math.floor(
+                        diffTime / (1000 * 60 * 60 * 24)
+                    )
+                );
             }
+
+            const daysInactive = daysSince(changedDateValue);
+            // Fall back to the last edit when ADO does not
+            // expose a state-change date for this work item.
+            const rawDaysInState = daysSince(stateChangedValue);
+            const daysInState = rawDaysInState || daysInactive;
 
             return {
 
@@ -152,8 +160,14 @@ async function getWorkItemByMember(memberName) {
                 last_updated:
                     fields["System.ChangedDate"],
 
+                state_changed:
+                    fields["Microsoft.VSTS.Common.StateChangeDate"] || null,
+
                 days_inactive:
-                    daysInactive
+                    daysInactive,
+
+                days_in_state:
+                    daysInState
             };
         });
 
@@ -208,7 +222,11 @@ async function saveWorkItem(params) {
         source_system,
         title,
         state,
-        priority
+        priority,
+        inactive_days,
+        days_in_state,
+        last_updated,
+        state_changed
     } = params;
 
     const query = `
@@ -219,9 +237,13 @@ async function saveWorkItem(params) {
             source_system,
             title,
             state,
-            priority
+            priority,
+            inactive_days,
+            days_in_state,
+            last_updated,
+            state_changed
         )
-        VALUES ($1, $2, $3, $4, $5, $6)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING *
     `;
 
@@ -231,7 +253,11 @@ async function saveWorkItem(params) {
         source_system,
         title,
         state,
-        priority
+        priority,
+        Number.isFinite(Number(inactive_days)) ? Number(inactive_days) : 0,
+        Number.isFinite(Number(days_in_state)) ? Number(days_in_state) : 0,
+        last_updated || null,
+        state_changed || null
     ];
 
     const result =
@@ -240,8 +266,104 @@ async function saveWorkItem(params) {
     return result;
 }
 
+// ===========================================
+// REFRESH AN EXISTING SNAPSHOT
+// saveWorkItem() only ever INSERTs, so a ticket
+// that was snapshotted once kept its very first
+// state forever (the PDF report, the question
+// text and the next session's questions all read
+// work_items.state). Called with the live Azure
+// DevOps values right before a new standup, so
+// the stored snapshot is never older than the
+// last run.
+//
+// Rows are matched on the EXTERNAL ticket id so
+// duplicate snapshots of the same ticket stay in
+// step with each other.
+// ===========================================
+
+async function refreshWorkItemSnapshot(item) {
+
+    const externalId =
+        item && item.id !== null && item.id !== undefined
+            ? String(item.id).trim()
+            : '';
+
+    if (!externalId) {
+        return [];
+    }
+
+    const query = `
+        UPDATE work_items
+        SET title         = $1,
+            state         = $2,
+            inactive_days = $3,
+            days_in_state = $4,
+            last_updated  = $5,
+            state_changed = $6
+        WHERE external_ticket_id = $7
+        RETURNING *
+    `;
+
+    const values = [
+        item.title || null,
+        item.state || null,
+        Number.isFinite(Number(item.days_inactive)) ? Number(item.days_inactive) : 0,
+        Number.isFinite(Number(item.days_in_state)) ? Number(item.days_in_state) : 0,
+        item.last_updated || null,
+        item.state_changed || null,
+        externalId
+    ];
+
+    const result =
+        await pool.query(query, values);
+
+    return result.rows;
+}
+
+// ===========================================
+// APPLY A CONFIRMED STATE CHANGE
+// Called after a work-item state was successfully
+// pushed to Azure DevOps from the web chat
+// "Proposed Azure DevOps Updates" card. The board
+// and the local snapshot would otherwise disagree
+// (the report PDF reads work_items.state, so a
+// ticket moved to Done kept printing "Doing").
+//
+// The item was just touched, so it has been zero
+// days in its new state and zero days inactive.
+// ===========================================
+
+async function applyWorkItemState(externalTicketId, state) {
+
+    const externalId =
+        externalTicketId !== null && externalTicketId !== undefined
+            ? String(externalTicketId).trim()
+            : '';
+
+    if (!externalId || !state) {
+        return [];
+    }
+
+    const result = await pool.query(
+        `UPDATE work_items
+         SET state         = $1,
+             state_changed = NOW(),
+             last_updated  = NOW(),
+             inactive_days = 0,
+             days_in_state = 0
+         WHERE external_ticket_id = $2
+         RETURNING *`,
+        [String(state), externalId]
+    );
+
+    return result.rows;
+}
+
 module.exports = {
     getWorkItemByMember,
     saveWorkItem,
+    refreshWorkItemSnapshot,
+    applyWorkItemState,
     workItemAssignedTo
 };

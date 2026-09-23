@@ -49,14 +49,18 @@ const MAX_WIQL_RESULTS = Number(process.env.AZURE_WIQL_MAX_RESULTS) || 200;
 
 // Fields consumed downstream (see workItemService):
 // title/state for the adaptive card, the display-name
-// assignee for member filtering, and the last-changed
-// timestamp used to derive the inactivity badge.
+// assignee for member filtering, the last-changed
+// timestamp used to derive the activity badge, and the
+// state-change timestamp, which tells how long an item
+// has been sitting in its CURRENT state (the honest
+// number for "not started" / "blocked" hints).
 const WORK_ITEM_DETAIL_FIELDS = [
     'System.Id',
     'System.Title',
     'System.State',
     'System.AssignedTo',
-    'System.ChangedDate'
+    'System.ChangedDate',
+    'Microsoft.VSTS.Common.StateChangeDate'
 ];
 
 // =============================================
@@ -155,7 +159,161 @@ async function getWorkItemDetails(ids) {
     }
 }
 
+// =============================================
+// GET WORK ITEM DETAILS - RESILIENT
+// Same as getWorkItemDetails(), but one unusable id
+// no longer costs the whole result set. Azure DevOps
+// rejects an entire batch with 404 when a single id is
+// unknown or not readable (e.g. a ticket from another
+// project that was snapshotted earlier), which would
+// otherwise silently disable every caller that needs
+// live states - the PDF report above all. On a batch
+// failure each id is retried on its own and the ones
+// that do exist are returned.
+// =============================================
+
+async function getWorkItemDetailsResilient(ids) {
+
+    const normalizedIds =
+        Array.isArray(ids) ? ids : [ids];
+
+    const cleanIds =
+        normalizedIds
+            .filter(id => id !== null && id !== undefined)
+            .map(id => String(id).trim())
+            .filter(id => id.length > 0);
+
+    if (cleanIds.length === 0) {
+        return [];
+    }
+
+    try {
+        return await getWorkItemDetails(cleanIds);
+    } catch (error) {
+
+        // Single id: nothing to salvage.
+        if (cleanIds.length === 1) {
+            console.error(
+                'Azure DevOps: work item ' + cleanIds[0] +
+                ' could not be fetched:', error.message
+            );
+            return [];
+        }
+
+        console.warn(
+            'Azure DevOps: batch of ' + cleanIds.length +
+            ' work item(s) failed (' + error.message +
+            ') - retrying individually.'
+        );
+
+        const results = [];
+
+        for (const id of cleanIds) {
+            try {
+                results.push(...await getWorkItemDetails([id]));
+            } catch (singleError) {
+                console.error(
+                    'Azure DevOps: skipping unreadable work item ' +
+                    id + ':', singleError.message
+                );
+            }
+        }
+
+        return results;
+    }
+}
+
+// =============================================
+// ADD A COMMENT TO A WORK ITEM
+// Used by the evening-standup "Proposed Azure DevOps
+// Updates" flow: the member's answer is posted as a
+// follow-up comment on the ticket (after explicit
+// confirmation in the web chat).
+// =============================================
+
+async function addWorkItemComment(externalId, text) {
+    const response = await axios.post(
+        `https://dev.azure.com/${ organization }/${ project }/_apis/wit/workitems/${ externalId }/comments`,
+        { text: String(text || '') },
+        {
+            params: {
+                'api-version': '7.0-preview.3'
+            },
+            headers
+        }
+    );
+
+    return response.data;
+}
+
+// =============================================
+// UPDATE THE STATE OF A WORK ITEM
+// JSON-Patch update of System.State (e.g. moving a
+// ticket to Done when the member reports completion).
+// =============================================
+
+async function updateWorkItemState(externalId, state) {
+    const response = await axios.patch(
+        `https://dev.azure.com/${ organization }/${ project }/_apis/wit/workitems/${ externalId }`,
+        [
+            {
+                op: 'add',
+                path: '/fields/System.State',
+                value: String(state)
+            }
+        ],
+        {
+            params: {
+                'api-version': '7.0'
+            },
+            headers: {
+                ...headers,
+                'Content-Type': 'application/json-patch+json'
+            }
+        }
+    );
+
+    return response.data;
+}
+
+// =============================================
+// CURRENT STATE OF MANY WORK ITEMS
+// Returns a Map of ticket id -> System.State, used
+// wherever the LOCAL snapshot may have gone stale
+// (the report PDF, the sync script). Delegates the
+// fetch to getWorkItemDetailsResilient(), so one
+// unreadable ticket cannot knock out the states of
+// all the others.
+// =============================================
+
+async function getWorkItemStates(ids) {
+
+    const items =
+        await getWorkItemDetailsResilient(ids);
+
+    const stateById = new Map();
+
+    for (const item of items) {
+        const state =
+            item && item.fields ? item.fields['System.State'] : null;
+
+        if (state) {
+            stateById.set(String(item.id), state);
+        }
+    }
+
+    return stateById;
+}
+
+// =============================================
+// EXPORTS
+// =============================================
+
 module.exports = {
     getWorkItems,
-    getWorkItemDetails
+    getWorkItemDetails,
+    getWorkItemDetailsResilient,
+    getWorkItemStates,
+    addWorkItemComment,
+    updateWorkItemState
 };

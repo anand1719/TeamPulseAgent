@@ -300,9 +300,109 @@ function assessSessionEscalation(rows) {
     };
 }
 
+// =============================================
+// PROPOSE AZURE DEVOPS UPDATES FROM ANSWERS
+// For every answered ticket question, propose a
+// status change + a polished comment that can be
+// pushed to the Azure DevOps board after explicit
+// user confirmation (web chat "Confirm Updates").
+//
+// AI-first: Groq returns strict JSON
+//   [{ "ticketId": "101", "proposedStatus": "Done",
+//      "comment": "JWT validation and token
+//                  expiration handling completed." }]
+// Deterministic fallback (no key / parse failure):
+//   comment = the member's own response text,
+//   status  = keyword-mapped (completed/done -> Done,
+//             working on/started -> In Progress,
+//             otherwise the ticket's current state).
+//
+// Returns: [{ ticketId, title, currentState,
+//             proposedStatus, comment }]
+// =============================================
+
+const DONE_HINTS = [
+    'completed', 'done', 'finished', 'fixed', 'closed',
+    'merged', 'deployed', 'shipped', 'resolved'
+];
+
+const IN_PROGRESS_HINTS = [
+    'working on', 'in progress', 'started', 'developing',
+    'testing', 'ongoing', 'continuing', 'wip'
+];
+
+function fallbackStatusFor(responseText, currentState) {
+    const t = String(responseText || '').toLowerCase();
+
+    if (DONE_HINTS.some(k => t.includes(k))) {
+        return 'Done';
+    }
+    if (IN_PROGRESS_HINTS.some(k => t.includes(k))) {
+        return 'In Progress';
+    }
+    return currentState || 'In Progress';
+}
+
+async function proposeWorkItemUpdates(rows) {
+    const items = (rows || []).filter(r => r.response && r.ticket_id);
+
+    if (!items.length) {
+        return [];
+    }
+
+    const ticketLines = items.map(r =>
+        `- ticketId: "${ r.ticket_id }", title: "${ r.work_item_title || '' }", ` +
+        `currentState: "${ r.work_item_state || '' }", ` +
+        `memberResponse: "${ String(r.response).replace(/\s+/g, ' ').trim() }"`
+    ).join('\n');
+
+    const aiResult = await callGroq(
+        `For each standup answer below, propose an Azure DevOps work-item update.\n` +
+        `Infer the new state from the response (e.g. work completed -> "Done", ` +
+        `still working -> "In Progress") and write a short polished past-tense comment.\n` +
+        `Reply with strict JSON only: an array of ` +
+        `{"ticketId":"<id>","proposedStatus":"<state>","comment":"<text>"}\n\n` +
+        ticketLines,
+        'You convert daily standup answers into Azure DevOps work-item updates. Reply strict JSON only.'
+    );
+
+    let proposals = null;
+    if (aiResult) {
+        try {
+            const parsed = JSON.parse(aiResult);
+            if (Array.isArray(parsed)) {
+                proposals = parsed;
+            }
+        } catch (e) {
+            // keep deterministic fallback
+        }
+    }
+
+    return items.map(r => {
+        const p = proposals
+            ? proposals.find(x => String(x.ticketId) === String(r.ticket_id))
+            : null;
+
+        return {
+            ticketId: String(r.ticket_id),
+            title: r.work_item_title || '',
+            currentState: r.work_item_state || '',
+            proposedStatus:
+                p && p.proposedStatus
+                    ? p.proposedStatus
+                    : fallbackStatusFor(r.response, r.work_item_state),
+            comment:
+                p && p.comment
+                    ? String(p.comment).trim()
+                    : String(r.response).trim()
+        };
+    });
+}
+
 module.exports = {
     generateDynamicQuestion,
     analyzeResponse,
     generateSessionInsights,
-    assessSessionEscalation
+    assessSessionEscalation,
+    proposeWorkItemUpdates
 };

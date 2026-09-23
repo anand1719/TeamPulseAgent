@@ -14,15 +14,24 @@
 
 // =============================================
 // STATE-AWARE ACTIVITY BADGE
-// A blanket "⚠️ inactive" for every ticket that
-// has not been edited in N days is misleading:
-//   - "To Do" items were never started -> they are
-//     "not started", not "inactive".
-//   - "Done" / "Closed" items are finished and
-//     should never be flagged at all.
-//   - Only items in an active state that have been
-//     untouched for >= threshold days are truly
-//     "inactive".
+// The badge describes the WORK ITEM STATE and must
+// never contradict it:
+//   - "Doing" / "In Progress" items are ACTIVE by
+//     definition. Azure DevOps' System.ChangedDate
+//     only moves when a field is edited - writing
+//     code, commits and PRs never touch it - so a
+//     genuinely active ticket could still report
+//     "16 days" and was wrongly labelled "⚠️
+//     inactive". Active items are therefore never
+//     flagged anymore.
+//   - "To Do" / "New" items were never started ->
+//     "⏳ not started".
+//   - "Blocked" / "On Hold" items are stalled ->
+//     "⛔ blocked", reported with the time spent in
+//     that state.
+//   - "Done" / "Closed" items are finished and are
+//     never flagged at all.
+//   - Unknown states are never guessed at.
 // The threshold is configurable via
 // INACTIVE_DAYS_THRESHOLD (default 5).
 // =============================================
@@ -31,12 +40,27 @@ const INACTIVE_DAYS_THRESHOLD =
     Number(process.env.INACTIVE_DAYS_THRESHOLD) || 5;
 
 const TERMINAL_STATES = new Set([
-    'done', 'closed', 'resolved', 'removed', 'completed', 'cut'
+    'done', 'closed', 'resolved', 'removed', 'completed', 'cut',
+    'cancelled', 'canceled', 'rejected'
 ]);
 
 const NOT_STARTED_STATES = new Set([
     'to do', 'todo', 'new', 'approved', 'proposed', 'backlog',
     'open', 'triaged', 'design in progress'
+]);
+
+// Work in progress: the item IS active, no badge.
+const ACTIVE_STATES = new Set([
+    'doing', 'in progress', 'inprogress', 'active', 'started',
+    'committed', 'in development', 'development', 'implementing',
+    'in review', 'review', 'code review', 'in testing', 'testing',
+    'qa', 'ready for testing', 'ready for review'
+]);
+
+// Stalled although the workflow expects progress.
+const BLOCKED_STATES = new Set([
+    'blocked', 'on hold', 'hold', 'waiting', 'waiting for approval',
+    'impeded', 'paused', 'stalled', 'stuck'
 ]);
 
 function normalizeState(state) {
@@ -52,17 +76,38 @@ function sanitizeInactiveDays(inactiveDays) {
         : 0;
 }
 
-function buildStateBadge(state, inactiveDays) {
+/**
+ * Build the state suffix shown next to "State: <state>".
+ *
+ * @param {string} state          Work item state (e.g. "Doing")
+ * @param {number|string} inactiveDays  Days since the last field edit
+ * @param {number|string} [daysInState] Days spent in the current state
+ *        (Microsoft.VSTS.Common.StateChangeDate); falls back to
+ *        inactiveDays when the source cannot provide it.
+ */
+function buildStateBadge(state, inactiveDays, daysInState) {
     const normalizedState = normalizeState(state);
-    const days = sanitizeInactiveDays(inactiveDays);
 
-    // Finished work is never "inactive".
+    // Finished or unknown work is never flagged.
     if (!normalizedState || TERMINAL_STATES.has(normalizedState)) {
         return '';
     }
 
-    // Nothing to flag while the item has been touched
-    // inside the threshold window.
+    // Active work is active - whatever the last edit date says.
+    // (System.ChangedDate does not move for commits / PRs / code,
+    // so flagging these items as "inactive" was a false alarm.)
+    if (ACTIVE_STATES.has(normalizedState)) {
+        return '';
+    }
+
+    // Time spent in the current state is the honest number for
+    // "not started" / "blocked"; fall back to the last edit when
+    // the source does not expose a state-change date.
+    const days = sanitizeInactiveDays(daysInState) ||
+        sanitizeInactiveDays(inactiveDays);
+
+    // Nothing to flag while the item has been in this state
+    // for less than the threshold window.
     if (days < INACTIVE_DAYS_THRESHOLD) {
         return '';
     }
@@ -71,9 +116,12 @@ function buildStateBadge(state, inactiveDays) {
         return ` · ⏳ not started (${ days }d)`;
     }
 
-    // Any remaining state (In Progress, Blocked, etc.)
-    // that has been untouched for >= threshold days.
-    return ` · ⚠️ inactive (${ days }d)`;
+    if (BLOCKED_STATES.has(normalizedState)) {
+        return ` · ⛔ blocked (${ days }d)`;
+    }
+
+    // Any other state: no claim about activity.
+    return '';
 }
 
 /**
@@ -85,7 +133,8 @@ function buildStateBadge(state, inactiveDays) {
  * @param {string} params.ticketLabel  e.g. "ADO-102" or "Ticket 102"
  * @param {string} params.title        Work item title
  * @param {string} params.state        Work item state
- * @param {number|string} params.inactiveDays  Days inactive
+ * @param {number|string} params.inactiveDays  Days since last field edit
+ * @param {number|string} params.daysInState  Days spent in the current state
  * @param {string} params.question     The AI-generated question text
  * @param {number} params.timeoutMinutes  Response deadline shown in card
  */
@@ -97,12 +146,13 @@ function buildQuestionCard(params) {
         title,
         state,
         inactiveDays = 0,
+        daysInState = 0,
         question,
         timeoutMinutes
     } = params;
 
     const inactiveSuffix =
-        buildStateBadge(state, inactiveDays);
+        buildStateBadge(state, inactiveDays, daysInState);
 
     const body = [
         {
@@ -140,32 +190,19 @@ function buildQuestionCard(params) {
             weight: 'Bolder'
         },
         {
-            type: 'ActionSet',
-            actions: [
-                {
-                    type: 'Action.Submit',
-                    title: 'In Progress',
-                    data: {
-                        questionId,
-                        status: 'In Progress'
-                    }
-                },
-                {
-                    type: 'Action.Submit',
-                    title: 'Blocked',
-                    data: {
-                        questionId,
-                        status: 'Blocked'
-                    }
-                },
-                {
-                    type: 'Action.Submit',
-                    title: 'Done',
-                    data: {
-                        questionId,
-                        status: 'Done'
-                    }
-                }
+            // SELECTION ONLY - picking a status does NOT submit
+            // the card. A response is recorded exclusively by the
+            // "Submit Update" action below, so a status click can
+            // never save an update (let alone an ANSWERED
+            // question) on its own.
+            type: 'Input.ChoiceSet',
+            id: 'status',
+            style: 'expanded',
+            isMultiSelect: false,
+            choices: [
+                { title: 'In Progress', value: 'In Progress' },
+                { title: 'Blocked', value: 'Blocked' },
+                { title: 'Done', value: 'Done' }
             ]
         },
         {
@@ -193,6 +230,12 @@ function buildQuestionCard(params) {
         body,
         actions: [
             {
+                // The ONLY way to record an answer. The channel merges
+                // every input of the card into this payload:
+                //   { questionId, fromInput: true, update: '...', status: '...' }
+                // `fromInput` is what tells the bot the member really
+                // submitted the card; a bare status payload (old cards)
+                // is rejected instead of being saved as an answer.
                 type: 'Action.Submit',
                 title: 'Submit Update',
                 data: {
@@ -215,7 +258,8 @@ function buildSummaryCard(params) {
         blockers,
         risks,
         recommendations,
-        sentiment
+        sentiment,
+        reportUrl
     } = params;
 
     const body = [
@@ -286,12 +330,42 @@ function buildSummaryCard(params) {
         });
     }
 
-    return {
+    // Download hint sits with the report action, so it is
+    // only shown when a report URL is available.
+    if (reportUrl) {
+        body.push({
+            type: 'TextBlock',
+            text:
+                '📄 Download the full report as a PDF — session ' +
+                'overview, AI insights, flags, participation and ' +
+                'per-ticket responses.',
+            isSubtle: true,
+            size: 'Small',
+            wrap: true
+        });
+    }
+
+    const card = {
         type: 'AdaptiveCard',
         $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
         version: '1.4',
         body
     };
+
+    if (reportUrl) {
+        // Action.OpenUrl cannot suggest a download name, but the
+        // report endpoint sends Content-Disposition, so the browser
+        // saves the file as "standup-summary-<team>-<date>.pdf".
+        card.actions = [
+            {
+                type: 'Action.OpenUrl',
+                title: 'Download PDF Report',
+                url: reportUrl
+            }
+        ];
+    }
+
+    return card;
 }
 
 /**
@@ -333,5 +407,6 @@ function buildEscalationNoticeCard(params) {
 module.exports = {
     buildQuestionCard,
     buildSummaryCard,
-    buildEscalationNoticeCard
+    buildEscalationNoticeCard,
+    buildStateBadge
 };

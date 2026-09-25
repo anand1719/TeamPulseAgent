@@ -1,0 +1,109 @@
+{
+    "version": "0.2.0",
+
+    // ================================================================
+    // This launch.json lives in the MONOREPO ROOT, which is the folder
+    // that is actually opened in VS Code:
+    //
+    //   Smart_Standup_Agent_System/     <-- workspaceFolder
+    //       nextgen-standup-bot/        <-- Node bot + Express API
+    //       team-pulse-web/             <-- Next.js web app
+    //
+    // ${workspaceFolder} therefore resolves to the monorepo root, so
+    // every program / cwd / envFile path must start with
+    // "nextgen-standup-bot/". Without that prefix Node is asked to run
+    // "<workspaceFolder>/server.js", which does not exist and fails with:
+    //   Error: Cannot find module '...\\Smart_Standup_Agent_System\\server.js'
+    //
+    // nextgen-standup-bot/.vscode/launch.json is kept as-is for the case
+    // where that folder is opened directly as the workspace.
+    // ================================================================
+
+    "compounds": [
+        {
+            "name": "Debug Full NextGen Standup Agent (API + Bot)",
+            "configurations": [
+                "Debug API Server (server.js)",
+                "Debug Bot (index.js)"
+            ],
+            "stopAll": true
+        }
+    ],
+
+    "configurations": [
+
+        // ================================================
+        // Express REST API (http://localhost:5000/api/*)
+        // ================================================
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Debug API Server (server.js)",
+
+            "program": "${workspaceFolder}/nextgen-standup-bot/server.js",
+            "cwd": "${workspaceFolder}/nextgen-standup-bot",
+
+            // server.js does not call dotenv.config() itself, so we load
+            // .env explicitly to make GROQ_API_KEY / GROQ_MODEL available.
+            "envFile": "${workspaceFolder}/nextgen-standup-bot/.env",
+
+            "console": "integratedTerminal",
+            "internalConsoleOptions": "openOnSessionStart",
+
+            "restart": true,
+            "autoAttachChildProcesses": true,
+
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ]
+        },
+
+        // ================================================
+        // Bot Framework bot (http://localhost:3978/api/messages)
+        // ================================================
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Debug Bot (index.js)",
+
+            "program": "${workspaceFolder}/nextgen-standup-bot/index.js",
+            "cwd": "${workspaceFolder}/nextgen-standup-bot",
+
+            // index.js already loads .env via dotenv.config();
+            // envFile is redundant but harmless and keeps parity
+            // with the API server config.
+            "envFile": "${workspaceFolder}/nextgen-standup-bot/.env",
+
+            "console": "integratedTerminal",
+            "internalConsoleOptions": "openOnSessionStart",
+
+            "restart": true,
+            "autoAttachChildProcesses": true,
+
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ]
+        },
+
+        // ================================================
+        // Attach to a process started outside VS Code
+        // e.g.  node --inspect=9229 server.js
+        // (run from the nextgen-standup-bot folder)
+        // ================================================
+        {
+            "type": "node",
+            "request": "attach",
+            "name": "Attach to Running Node Process",
+
+            "port": 9229,
+            "restart": true,
+
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ]
+        }
+    ]
+}

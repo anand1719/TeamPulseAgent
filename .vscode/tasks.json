@@ -1,0 +1,66 @@
+{
+    "version": "2.0.0",
+
+    // ================================================================
+    // The workspace root is the monorepo root, so the Node entry points
+    // live in "nextgen-standup-bot". These tasks set cwd explicitly so a
+    // task (or the integrated terminal) never resolves "server.js" against
+    // the monorepo root, which fails with:
+    //   Error: Cannot find module '...\\Smart_Standup_Agent_System\\server.js'
+    // ================================================================
+
+    "tasks": [
+        {
+            "label": "API Server (nextgen-standup-bot/server.js)",
+            "type": "shell",
+            "command": "node server.js",
+            "options": {
+                "cwd": "${workspaceFolder}/nextgen-standup-bot"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "Bot (nextgen-standup-bot/index.js)",
+            "type": "shell",
+            "command": "npm run watch",
+            "options": {
+                "cwd": "${workspaceFolder}/nextgen-standup-bot"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "Bot + API together (npm run dev)",
+            "type": "shell",
+            "command": "npm run dev",
+            "options": {
+                "cwd": "${workspaceFolder}/nextgen-standup-bot"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "Web App (team-pulse-web)",
+            "type": "shell",
+            "command": "npm run dev",
+            "options": {
+                "cwd": "${workspaceFolder}/team-pulse-web"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        }
+    ]
+}

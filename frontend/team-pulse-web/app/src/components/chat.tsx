@@ -126,6 +126,30 @@ function statusForCountdown(scheduleTime: string): Date {
   return next;
 }
 
+// TODAY'S occurrence of scheduleTime, with NO tomorrow rollover.
+// Used by the countdown grace window: once today's time has passed
+// we get a negative "how long ago" instead of a far-future target.
+function todaysOccurrence(scheduleTime: string): Date {
+  const match = /^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(scheduleTime || "");
+  const today = new Date();
+  if (!match) {
+    today.setHours(18, 0, 0, 0); // same fallback as statusForCountdown
+    return today;
+  }
+  today.setHours(
+    Number(match[1]),
+    Number(match[2]),
+    match[3] ? Number(match[3]) : 0,
+    0
+  );
+  return today;
+}
+
+// Grace window: how long after the scheduled time the UI keeps
+// showing "Starting…" (instead of rolling over to tomorrow) while
+// waiting for the scheduler to create today's session.
+const COUNTDOWN_GRACE_MS = 2 * 60 * 1000;
+
 function formatCountdown(target: Date): string {
   const ms = Math.max(0, target.getTime() - Date.now());
   const h = Math.floor(ms / 3600000);
@@ -159,6 +183,11 @@ export default function Chat() {
   const [refreshing, setRefreshing] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  // Session id the current chat history belongs to. When bootstrap
+  // reports a different session (a new day's standup, or none at all
+  // after a reset), the old conversation is dropped so the previous
+  // standup's chat never bleeds into the next one.
+  const sessionScopeRef = useRef<number | null>(null);
 
   const pushMessage = useCallback(
     (sender: "bot" | "user", text: string, analysis?: AnalysisResult) => {
@@ -205,6 +234,15 @@ export default function Chat() {
     setWorkItems((d.workItems ?? []).map(mapWorkItem));
     setProgress(d.progress ?? null);
     setSession(d.session ?? null);
+    const sessionId = d.session?.id ?? null;
+    if (sessionId !== sessionScopeRef.current) {
+      sessionScopeRef.current = sessionId;
+      setMessages([]);
+      setPendingQuestions([]);
+      setProposals([]);
+      setConfirmResults(null);
+      setSummaryText(null);
+    }
     if (!d.standupScheduled || !d.session) {
       setPhase("scheduled");
       return;
@@ -246,8 +284,13 @@ export default function Chat() {
     };
   }, [runBootstrap]);
 
+  // Re-poll in "scheduled" (waiting for today's session) and in
+  // "completed" (a reset / re-run may have replaced today's session —
+  // applyBootstrap then wipes the old conversation and flips to
+  // "active"). The "active" phase does not poll: it is driven by
+  // question answers instead.
   useEffect(() => {
-    if (phase !== "scheduled") return;
+    if (phase !== "scheduled" && phase !== "completed") return;
     const t = setInterval(() => {
       runBootstrap();
     }, 60000);
@@ -260,6 +303,13 @@ export default function Chat() {
   // standup is already done. Once the configured time has passed,
   // statusForCountdown() points at tomorrow's occurrence, so the
   // timer rolls over to ~24h.
+  //
+  // Grace window: in the "scheduled" phase, for COUNTDOWN_GRACE_MS
+  // after today's time passes we show "Starting…" instead of rolling
+  // over, covering the gap until the scheduler creates today's
+  // session (picked up by the 60s poll or "Check now"). After the
+  // grace expires — or in the "completed" phase — the normal
+  // rollover applies.
   useEffect(() => {
     if (
       (phase !== "scheduled" && phase !== "completed") ||
@@ -269,6 +319,14 @@ export default function Chat() {
     }
     const scheduleTime = schedule.scheduleTime;
     const tick = () => {
+      if (phase === "scheduled") {
+        const now = Date.now();
+        const passedMs = now - todaysOccurrence(scheduleTime).getTime();
+        if (passedMs >= 0 && passedMs < COUNTDOWN_GRACE_MS) {
+          setCountdown("Starting…");
+          return;
+        }
+      }
       const target = statusForCountdown(scheduleTime);
       setCountdown(formatCountdown(target));
     };
@@ -279,15 +337,21 @@ export default function Chat() {
 
   // ---------- answering ----------
 
-  async function handleSend() {
-    const text = input.trim();
-    const current = pendingQuestions[0];
-    if (!text || sending || !current) return;
+  // Shared answer path for both the question card (comment + status)
+  // and the fallback bottom composer (plain text, no pending question).
+  async function submitAnswer(current: Question, comment: string, status?: string) {
+    const text = comment.trim();
+    if ((!text && !status) || sending) return;
     setInput("");
     setSending(true);
-    pushMessage("user", text);
+    // The user bubble always shows what was typed; a status-only
+    // submit still leaves a visible trace of the chosen status.
+    pushMessage("user", text || `Status → ${status}`);
     try {
-      const result = await answerQuestion(current.id, { response: text });
+      const result = await answerQuestion(current.id, {
+        response: text,
+        status,
+      });
       if (result.alreadyAnswered) {
         pushMessage("bot", "That question was already answered — moving on.");
         return;
@@ -296,7 +360,7 @@ export default function Chat() {
       pushMessage(
         "bot",
         result.nextQuestion
-          ? `${result.nextQuestion.question}`
+          ? "✅ Response recorded — here's your next question:"
           : "Thanks! That was the last one — compiling your standup.",
         a
       );
@@ -323,6 +387,21 @@ export default function Chat() {
     } finally {
       setSending(false);
     }
+  }
+
+  // Question card submit: comment + ticket status.
+  function handleCardSubmit(comment: string, status: string) {
+    const current = pendingQuestions[0];
+    if (!current) return;
+    void submitAnswer(current, comment, status);
+  }
+
+  // Fallback bottom composer — only reachable when the active phase
+  // has no pending question card on screen.
+  function handleSend() {
+    const current = pendingQuestions[0];
+    if (!current) return;
+    void submitAnswer(current, input);
   }
 
   async function handleEscalate() {
@@ -548,29 +627,16 @@ export default function Chat() {
               {messages.map((m) => (
                 <MessageBubble key={m.id} message={m} />
               ))}
-              {phase === "active" &&
-                messages.length === 0 &&
-                pendingQuestions.length > 0 && (
-                  <MessageBubble
-                    message={{
-                      id: 0,
-                      sender: "bot",
-                      text: `You have ${pendingQuestions.length} active work item${
-                        pendingQuestions.length === 1 ? "" : "s"
-                      } today. Let's do your evening standup. 🌙`,
-                      time: timeNow(),
-                    }}
-                  />
-                )}
               {phase === "active" && pendingQuestions[0] && (
                 <div className="mt-2 flex flex-col gap-2">
-                  <MessageBubble
-                    message={{
-                      id: -1,
-                      sender: "bot",
-                      text: pendingQuestions[0].question,
-                      time: timeNow(),
-                    }}
+                  <QuestionCard
+                    question={pendingQuestions[0]}
+                    showGreeting={messages.length === 0}
+                    pendingCount={pendingQuestions.length}
+                    scheduleTime={schedule?.scheduleTime ?? null}
+                    deadline={session?.response_deadline ?? null}
+                    sending={sending}
+                    onSubmit={handleCardSubmit}
                   />
                   {messages.some((m) => m.analysis?.blocker_detected) && (
                     <button
@@ -616,7 +682,10 @@ export default function Chat() {
           </div>
         )}
 
-        {phase === "active" && (
+        {/* Bottom composer is a fallback: while a question card is
+            on screen the card itself holds the comment box + status
+            dropdown, so a second input would be redundant. */}
+        {phase === "active" && !pendingQuestions[0] && (
           <div className="border-t border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
             <div className="mx-auto flex max-w-2xl items-center gap-3">
               <input
@@ -698,6 +767,190 @@ function Member({
         />
       </div>
       <span className="text-sm text-slate-300">{name}</span>
+    </div>
+  );
+}
+
+// Renders the backend question text, converting **bold** markdown
+// (e.g. "Reviewing code – **Doing**") into <strong> so the raw
+// asterisks never show up in the UI.
+function renderRichText(text: string) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) =>
+    part.startsWith("**") && part.endsWith("**") ? (
+      <strong key={i} className="font-semibold text-slate-900 dark:text-slate-100">
+        {part.slice(2, -2)}
+      </strong>
+    ) : (
+      <span key={i}>{part}</span>
+    )
+  );
+}
+
+// ADO work-item states offered in the question card's status
+// dropdown (same list the proposals card uses for editing).
+const ADO_STATUS_OPTIONS = ["New", "To Do", "Doing", "In Review", "Done", "Closed"];
+
+// ISO timestamp -> "HH:MM" local clock, e.g. the session's
+// response deadline "2026-10-06T10:46:00.000Z" -> "16:16".
+function formatClock(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// Dedicated card for the current standup question in the active
+// phase. Shows the work-item context (ticket, title, state, age)
+// as structured chips plus the question text — instead of dumping
+// everything into a plain chat bubble. The answer controls (comment
+// box + ticket status dropdown) live inside the card, mirroring the
+// Teams adaptive card layout.
+function QuestionCard({
+  question,
+  showGreeting,
+  pendingCount,
+  scheduleTime,
+  deadline,
+  sending,
+  onSubmit,
+}: {
+  question: Question;
+  showGreeting?: boolean;
+  pendingCount?: number;
+  scheduleTime?: string | null;
+  deadline?: string | null;
+  sending: boolean;
+  onSubmit: (comment: string, status: string) => void;
+}) {
+  const hasWorkItem = Boolean(question.ticket_id || question.work_item_title);
+  // Pre-select the ticket's current state when it is a known ADO
+  // state, otherwise fall back to "Doing".
+  const initialStatus =
+    question.work_item_state &&
+    ADO_STATUS_OPTIONS.includes(question.work_item_state)
+      ? question.work_item_state
+      : "Doing";
+  const [comment, setComment] = useState("");
+  const [status, setStatus] = useState(initialStatus);
+  // Submit requires a comment, or an explicitly changed status.
+  const statusChanged = status !== initialStatus;
+  const canSubmit = Boolean(comment.trim()) || statusChanged;
+
+  function handleSubmit() {
+    if (sending || !canSubmit) return;
+    onSubmit(comment.trim(), status);
+  }
+
+  return (
+    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950">
+      <div className="border-b border-slate-100 bg-slate-50 px-5 py-3 dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-blue-100 text-blue-600 dark:bg-blue-950 dark:text-blue-400">
+              <Bot size={15} />
+            </span>
+            <div>
+              <p className="text-sm font-semibold text-slate-800 dark:text-slate-100">
+                Evening standup question
+              </p>
+              {(scheduleTime || deadline) && (
+                <p className="text-[10px] text-slate-400">
+                  {scheduleTime && <>Scheduled {scheduleTime.slice(0, 5)}</>}
+                  {scheduleTime && deadline && " · "}
+                  {deadline && <>respond by {formatClock(deadline)}</>}
+                </p>
+              )}
+            </div>
+          </div>
+          {typeof question.days_in_state === "number" &&
+            question.days_in_state > 0 && (
+              <span className="text-[10px] text-slate-400">
+                {question.days_in_state}d in state
+              </span>
+            )}
+        </div>
+      </div>
+
+      <div className="px-5 py-4">
+        {showGreeting && (
+          <p className="mb-3 text-sm text-slate-600 dark:text-slate-300">
+            You have {pendingCount ?? 1} active work item
+            {(pendingCount ?? 1) === 1 ? "" : "s"} today. Let&apos;s do your
+            evening standup. 🌙
+          </p>
+        )}
+
+        {hasWorkItem && (
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            {question.ticket_id && (
+              <span className="font-semibold text-blue-600">
+                {question.ticket_id}
+              </span>
+            )}
+            {question.work_item_title && (
+              <span className="text-slate-600 dark:text-slate-300">
+                {question.work_item_title}
+              </span>
+            )}
+            {question.work_item_state && (
+              <span className="flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                <Circle size={8} className="fill-current" />
+                {question.work_item_state}
+              </span>
+            )}
+          </div>
+        )}
+
+        <p className="mt-3 text-sm leading-6 text-slate-700 dark:text-slate-200">
+          {renderRichText(question.question)}
+        </p>
+
+        {/* Answer controls — mirrors the Teams adaptive card
+            (Input.Text comment + Input.ChoiceSet status). */}
+        <label className="mt-4 block text-xs text-slate-500">
+          Comment
+          <textarea
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleSubmit();
+              }
+            }}
+            rows={3}
+            placeholder="Type your update…"
+            disabled={sending}
+            className="mt-1 w-full resize-y rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          />
+        </label>
+
+        <div className="mt-3 flex items-end justify-between gap-3">
+          <label className="text-xs text-slate-500">
+            Ticket status
+            <select
+              value={status}
+              onChange={(e) => setStatus(e.target.value)}
+              disabled={sending}
+              className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            >
+              {ADO_STATUS_OPTIONS.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <button
+            onClick={handleSubmit}
+            disabled={sending || !canSubmit}
+            className="flex h-9 items-center gap-2 rounded-full bg-blue-600 px-5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:opacity-50"
+          >
+            <Send size={14} /> Submit
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -895,7 +1148,7 @@ function AdoProposalsCard({
                     onChange={(e) => onChange(i, { status: e.target.value })}
                     className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm disabled:opacity-60"
                   >
-                    {["New", "To Do", "In Progress", "In Review", "Done", "Closed"].map(
+                    {["New", "To Do", "Doing", "In Review", "Done", "Closed"].map(
                       (s) => (
                         <option key={s} value={s}>
                           {s}

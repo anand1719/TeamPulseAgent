@@ -37,6 +37,7 @@ export type Question = {
   ticket_id?: string | null;
   work_item_title?: string | null;
   work_item_state?: string | null;
+  days_in_state?: number | null;
   member_name?: string;
   sentiment?: string | null;
   blocker_detected?: boolean | null;
